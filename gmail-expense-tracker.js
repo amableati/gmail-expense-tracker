@@ -27,10 +27,14 @@ function getLastExtractedDate() {
 }
 
 function fetchAllEmailsRaw() {
-  const ui = SpreadsheetApp.getUi();
+  // Check if there is a UI available (i.e., user is running it manually)
+  const ui = getUiSafe();
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Expenses");
-  if (!sheet) { ui.alert("Error: 'Expenses' sheet not found."); return; }
-
+  if (!sheet) { 
+    console.error("Sheet not found");
+    if (ui) ui.alert("Error: 'Expenses' sheet not found."); 
+    return; 
+  }
   // 1. Get the last date from the sheet automatically [cite: 57, 63]
   const startDateStr = getLastExtractedDate(); 
   
@@ -308,7 +312,13 @@ if (!parsedSuccessfully) {
   }
 
   sortExpensesByDate();
-  ui.alert("Done! Fetched " + rowsAddedCount + " records raw. Now use the clear duplicates tool.");
+  
+  const msg = "Done! Fetched " + rowsAddedCount + " records.";
+  if (ui) {
+    ui.alert(msg);
+  } else {
+    console.log(msg); // This will show up in your Apps Script execution log
+  }
 }
 
 function parseMyDate(dateStr) {
@@ -370,7 +380,7 @@ function cleanText(text) {
 
 // BUTTON 2: INTERACTIVE DUPLICATE & MERGE WIZARD
 function clearSheetDuplicates() {
-  const ui = SpreadsheetApp.getUi();
+  const ui = getUiSafe();
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Expenses");
   let data = sheet.getDataRange().getValues();
   
@@ -558,4 +568,28 @@ function onOpen() {
     .addItem('1. Fetch New Emails', 'fetchAllEmailsRaw')
     .addItem('2. Clean Duplicate Rows', 'clearSheetDuplicates')
     .addToUi();
+}
+
+//5.  SCHEDULAR
+function runAutomatedExpenseWorkflow() {
+  // 1. Fetch and process emails
+  // Note: We modified fetchAllEmailsRaw to be UI-safe
+  fetchAllEmailsRaw(); 
+  
+  // 2. Clean duplicates automatically
+  // Note: You must ensure clearSheetDuplicates is also UI-safe!
+  // clearSheetDuplicates();
+  
+  // 3. Ensure everything is sorted
+  sortExpensesByDate();
+  
+  console.log("Automated workflow completed successfully.");
+}
+
+function getUiSafe() {
+  try {
+    return SpreadsheetApp.getUi();
+  } catch (e) {
+    return null; // Return null if running in background
+  }
 }
