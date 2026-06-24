@@ -1,5 +1,30 @@
 const ALLOWED_CATEGORIES = "Travel, Shopping, Entertainment, Utility, Groceries, Investment, Food, Self Transfer, Health, Misc";
 
+//  SCHEDULAR
+function runAutomatedExpenseWorkflow() {
+  // 1. Fetch and process emails
+  // Note: We modified fetchAllEmailsRaw to be UI-safe
+  fetchAllEmailsRaw(); 
+  
+  // 2. Clean duplicates automatically
+  // Note: You must ensure clearSheetDuplicates is also UI-safe!
+  //clearSheetDuplicates();
+  
+  // 3. Ensure everything is sorted
+  sortExpensesByDate();
+  
+  console.log("Automated workflow completed successfully.");
+}
+
+function getUiSafe() {
+  try {
+    return SpreadsheetApp.getUi();
+  } catch (e) {
+    return null; // Return null if running in background
+  }
+}
+
+
 function getLastExtractedDate() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Expenses");
@@ -224,6 +249,7 @@ function fetchAllEmailsRaw() {
 
   // Fallback Engine
 if (!parsedSuccessfully) {
+  merchant = extractMerchant(fullBody, msg.getSubject());
   let details = extractBankDetails(fullBody);
   let amtM = fullBody.match(/(?:Rs\.|INR|₹)\s*([\d,]+\.\d{2})/i) || fullBody.match(/(?:Rs\.|INR|₹)\s*([\d,]+)/i) || msg.getSubject().match(/(?:₹|Rs\.|INR)\s*([\d,]+)/i);
   if (amtM) amount = amtM[1];
@@ -278,6 +304,9 @@ if (!parsedSuccessfully) {
       let emailDateStr = Utilities.formatDate(dateObj, Session.getScriptTimeZone(), "yyyy-MM-dd");
       
       let category = autoCategorize(merchant, msg.getSubject(), columnType);
+      if (category === "IGNORE") {
+        continue; // Skip this row entirely
+      }
       
       // Generate a much cleaner log snippet
       let cleanLogText = fullBody.replace(/https?:\/\/[^\s]+/g, '') // Remove URLs
@@ -304,6 +333,7 @@ if (!parsedSuccessfully) {
           sourceBank = bankBase;
         }
       }
+
       // --- END OF CENTRALIZED LOGIC ---
       sheet.appendRow([emailDateStr, amount, merchant, paymentMode, category, columnType, sourceBank, textToLog]);
       rowsAddedCount++;
@@ -319,6 +349,33 @@ if (!parsedSuccessfully) {
   } else {
     console.log(msg); // This will show up in your Apps Script execution log
   }
+}
+
+function extractMerchant(body, subject) {
+  let text = body.replace(/<[^>]*>/g, ' '); // Strip HTML tags
+
+  // 1. Specific SIP Reminder rule
+  if (text.includes("Upcoming SIP installment")) return "SIP Reminder";
+
+  // 2. Credit Card Payment confirmations
+  if (text.includes("payment confirmation") && text.includes("credit card payment was successful")) return "Credit Card Payment";
+
+  // 3. ICICI / UPI Card Patterns: Look for "at [Merchant] on"
+  let atMatch = text.match(/at\s+([A-Z0-9\s]+?)\s+(?:on|the|is)/i);
+  if (atMatch) return atMatch[1].trim();
+
+  // 4. Indian Clearing Corp (SIPs)
+  if (text.includes("Indian Clearing")) return "Indian Clearing Corp";
+
+  // 5. VPA/UPI Names
+  let vpaMatch = text.match(/VPA\s+[^\s]+\s+([A-Z\s\.]+)(?:\s+on|\s+\d{2})/i);
+  if (vpaMatch) return vpaMatch[1].trim();
+
+  // 6. Bank Credit/Cashback rules
+  if (text.includes("credited to your HDFC Bank")) return "HDFC Bank Credit";
+  if (text.includes("cashback")) return "Cashback Received";
+
+  return "Unknown Merchant";
 }
 
 function parseMyDate(dateStr) {
@@ -501,6 +558,7 @@ function autoCategorize(merchant, subject, columnType) {
   let m = merchant.toLowerCase();
   let s = subject.toLowerCase();
 
+
   // 1. HIGH PRIORITY OVERRIDES (Check these before anything else)
   if (m.includes("nps") || m.includes("pran")) return "Investment";
   if (m.includes("atindra") || s.includes("self transfer")) return "Self Transfer";
@@ -558,6 +616,16 @@ function autoCategorize(merchant, subject, columnType) {
     return "Shopping";
   }
 
+  // 1. FILTER OUT NOISE (Add this at the top)
+  if (s.includes("no-reply") || s.includes("add to contact") || s.includes("marketing") || s.includes("failed") 
+      || s.includes("sorry") || s.includes("upcoming sip") || s.includes("surprise") || s.includes("wallet points") 
+      || s.includes("cashback")) {
+    return "IGNORE";
+  }
+
+  if (m.includes("cashback")) return "Inward Income";
+  if (merchant === "Reminder Auto Debit SIP") return "Investment";
+
   // Default
   return "Misc";
 }
@@ -568,28 +636,4 @@ function onOpen() {
     .addItem('1. Fetch New Emails', 'fetchAllEmailsRaw')
     .addItem('2. Clean Duplicate Rows', 'clearSheetDuplicates')
     .addToUi();
-}
-
-//5.  SCHEDULAR
-function runAutomatedExpenseWorkflow() {
-  // 1. Fetch and process emails
-  // Note: We modified fetchAllEmailsRaw to be UI-safe
-  fetchAllEmailsRaw(); 
-  
-  // 2. Clean duplicates automatically
-  // Note: You must ensure clearSheetDuplicates is also UI-safe!
-  // clearSheetDuplicates();
-  
-  // 3. Ensure everything is sorted
-  sortExpensesByDate();
-  
-  console.log("Automated workflow completed successfully.");
-}
-
-function getUiSafe() {
-  try {
-    return SpreadsheetApp.getUi();
-  } catch (e) {
-    return null; // Return null if running in background
-  }
 }
