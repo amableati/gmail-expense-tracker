@@ -37,7 +37,7 @@ function getLastExtractedDate() {
   const data = sheet.getDataRange().getValues();
   
   // If sheet is empty (only header or no rows), default to a start date
-  if (data.length <= 1) return "2025/05/01"; 
+  if (data.length <= 1) return "2026/04/01"; 
 
   let maxDate = new Date(0); 
   for (let r = 1; r < data.length; r++) {
@@ -52,303 +52,210 @@ function getLastExtractedDate() {
 }
 
 function fetchAllEmailsRaw() {
-  // Check if there is a UI available (i.e., user is running it manually)
   const ui = getUiSafe();
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Expenses");
-  if (!sheet) { 
-    console.error("Sheet not found");
-    if (ui) ui.alert("Error: 'Expenses' sheet not found."); 
-    return; 
-  }
-  // 1. Get the last date from the sheet automatically [cite: 57, 63]
+  if (!sheet) { ui && ui.alert("Error: 'Expenses' sheet not found."); return; }
+
   const startDateStr = getLastExtractedDate(); 
-  
-  // 2. Set end date to tomorrow so that the search captures everything up to today
-  let tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
+  let tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
   const endDateStr = Utilities.formatDate(tomorrow, Session.getScriptTimeZone(), "yyyy/MM/dd");
   
-  const afterDate = startDateStr.replace(/\//g, '-');
-  const beforeDate = endDateStr.replace(/\//g, '-');
-  
-  // 3. Updated Query: Now includes SmartPay and correct date range 
-  const gmailSearchQuery = `("debited" OR "credited" OR "Transaction alert" OR "SIP Auto Payment" OR "Buy order placed" OR "SmartPay") after:${afterDate} before:${beforeDate}`;
-  const threads = GmailApp.search(gmailSearchQuery, 0, 100); 
+  const gmailSearchQuery = `("debited" OR "credited" OR "Transaction alert" OR "SIP Auto Payment" OR "Buy order placed" OR "SmartPay" OR "Amazon Pay") -("reminder" OR "due") after:${startDateStr.replace(/\//g, '-')} before:${endDateStr.replace(/\//g, '-')}`;
+  const threads = GmailApp.search(gmailSearchQuery, 0, 500); 
 
-  if (threads.length === 0) {
-    ui.alert("No new transaction emails found since " + startDateStr);
-    return;
-  }
+  if (threads.length === 0) { ui && ui.alert("No new transactions found."); return; }
 
   let rowsAddedCount = 0;
-
-  for (let i = 0; i < threads.length; i++) {
-    const messages = threads[i].getMessages();
-    for (let j = 0; j < messages.length; j++) {
-      const msg = messages[j];
-      let fullBody = (msg.getPlainBody() || "").replace(/\s+/g, ' ').trim(); 
-      let amount = "0.00", merchant = "Unknown", txnDate = "", paymentMode = "Bank Account", columnType = "Expense", sourceBank = "Unknown Bank"; 
-      let lowerBody = fullBody.toLowerCase(), lowerSub = (msg.getSubject() || "").toLowerCase();
-
-      let bankBase = "Unknown Bank";
-      if (lowerBody.includes("hdfc bank") || lowerSub.includes("hdfc")) bankBase = "HDFC Bank";
-      else if (lowerBody.includes("icici bank") || lowerSub.includes("icici")) bankBase = "ICICI Bank";
-      else if (lowerBody.includes("kotak bank") || lowerSub.includes("kotak")) bankBase = "Kotak Bank";
-      else if (lowerBody.includes("state bank of india") || lowerBody.includes("sbi")) bankBase = "SBI";
-      else if (lowerBody.includes("axis bank") || lowerBody.includes("axis")) bankBase = "Axis Bank";
-
-      let parsedSuccessfully = false;
-
-            // Template 1: Axis / Generic UPI towards VPA (Fixed to extract bracket name over raw VPA link)
-      if (fullBody.includes("towards VPA")) {
-        let amtM = fullBody.match(/Rs\.\s*([\d,]+\.\d{2})/i);
-        let datM = fullBody.match(/on\s+(\d{2}-\d{2}-\d{2,4})/);
-        
-        // Match name inside brackets first. If missing, fall back to raw VPA address.
-        let bracketM = fullBody.match(/towards VPA\s+[^\s]+\s+\((.*?)\)/i);
-        let rawVpaM = fullBody.match(/towards VPA\s+([^\s]+)/i);
-        
-        amount = amtM ? amtM[1] : "0.00";
-        merchant = bracketM ? bracketM[1].trim() : (rawVpaM ? rawVpaM[1].trim() : "UPI Payment");
-        txnDate = datM ? datM[1] : "";
-        paymentMode = "UPI";
-        
-        let numM = fullBody.match(/account ending\s*(\d+)/i);
-        sourceBank = bankBase + (numM ? " (a/c " + numM[1] + ")" : "");
-        parsedSuccessfully = true;
+  for (const thread of threads) {
+    for (const msg of thread.getMessages()) {
+      let data = parseEmailMessage(msg);
+      // Only process if we found a valid amount
+      if (data && data.amount !== "0.00") {
+        if (processAndLogExpense(sheet, msg, data)) rowsAddedCount++;
       }
-      else if (fullBody.includes("ICICI Bank Account") && fullBody.includes("credited")) {
-        let amtM = fullBody.match(/credited with INR\s*([\d,]+)/i);
-        let datM = fullBody.match(/on\s+(\d{2}-[A-Za-z]{3}-\d{2,4})/i);
-        amount = amtM ? amtM[1] : "0.00";
-        txnDate = datM ? datM[1] : "";
-        merchant = "ICICI Interest Payment";
-        paymentMode = "Bank Credit";
-        columnType = "Income";
-        let numM = fullBody.match(/Account\s+([X\d]+)/i);
-        sourceBank = "ICICI Bank" + (numM ? " (" + numM[1] + ")" : "");
-        parsedSuccessfully = true;
-      }
-      else if (fullBody.includes("successfully debited") && fullBody.includes("towards")) {
-        let amtM = fullBody.match(/Rs\.\s*([\d,]+)/i);
-        let merM = fullBody.match(/towards\s+(.*?)\./i);
-        let datM = fullBody.match(/on\s+(\d{4}\/\d{2}\/\d{2})/);
-        amount = amtM ? amtM[1] : "0.00";
-        merchant = merM ? merM[1].replace(/[*]/g, '').trim() : "Kotak Debit";
-        txnDate = datM ? datM[1] : "";
-        paymentMode = "Bank Account";
-        sourceBank = "Kotak Bank";
-        parsedSuccessfully = true;
-      }
-      else if (fullBody.includes("credited to your Kotak Bank")) {
-        let amtM = fullBody.match(/Rs\.\s*([\d,]+)/i);
-        let datM = fullBody.match(/on\s+(\d{2}-[A-Za-z]{3}-\d{2,4})/i);
-        let merM = fullBody.match(/transaction from\s+(.*?)\./i);
-        amount = amtM ? amtM[1] : "0.00";
-        merchant = merM ? merM[1].trim() : "NEFT Credit";
-        txnDate = datM ? datM[1] : "";
-        paymentMode = "NEFT Inward";
-        columnType = "Income";
-        let numM = fullBody.match(/a\/c\s+([X\d]+)/i);
-        sourceBank = "Kotak Bank" + (numM ? " (" + numM[1] + ")" : "");
-        parsedSuccessfully = true;
-      }
-      else if (fullBody.includes("State Bank of India") && fullBody.includes("Amount:")) {
-        let amtM = fullBody.match(/Amount:\s*INR\s*([\d,]+\.\d{2})/i);
-        let datM = fullBody.match(/Date:\s*([\d\/]+)/i);
-        let merM = fullBody.match(/Sent by:\s*(.*?)\s*Sender/i);
-        amount = amtM ? amtM[1] : "0.00";
-        merchant = merM ? merM[1].trim() : "SBI Credit";
-        txnDate = datM ? datM[1] : "";
-        paymentMode = "NEFT Inward";
-        columnType = "Income";
-        let numM = fullBody.match(/Your A\/c:\s*([X\d]+)/i);
-        sourceBank = "SBI" + (numM ? " (" + numM[1] + ")" : "");
-        parsedSuccessfully = true;
-      }
-      else if (lowerSub.includes("sip auto payment") || lowerSub.includes("buy order placed")) {
-        let amtM = msg.getSubject().match(/(?:₹|Rs\.)\s*([\d,]+\.\d{2}|[\d,]+)/i) || fullBody.match(/(?:₹|Rs\.)\s*([\d,]+\.\d{2}|[\d,]+)/i);
-        let merM = fullBody.match(/in\s+(.*?)\s+has been/i) || fullBody.match(/order of.*?\s+in\s+(.*?)\s+has/i);
-        amount = amtM ? amtM[1] : "0.00";
-        merchant = merM ? merM[1].trim() : "Mutual Fund SIP";
-        paymentMode = "Auto-Debit";
-        let details = extractBankDetails(fullBody);
-        sourceBank = bankBase + (details ? " (a/c " + details + ")" : "");
-        parsedSuccessfully = true;
-      }
-      
-      else if (lowerBody.includes("smartpay")) {
-        // Extract Amount
-        let amtM = fullBody.match(/Rs\.\s*([\d,]+\.\d{2})/i);
-        amount = amtM ? amtM[1] : "0.00";
-        
-        // Extract Merchant/Biller Name
-        let merM = fullBody.match(/Biller Name:\s*(.*?)(?:Unique|$)/i);
-        merchant = merM ? merM[1].trim() : "SmartPay Bill";
-        
-        // Set other defaults
-        txnDate = ""; // You may need to add a regex for date if present
-        paymentMode = "SmartPay";
-        columnType = "Expense";
-        sourceBank = "SmartPay";
-        
-        parsedSuccessfully = true;
-      }
-      else if (fullBody.includes("HDFC Bank Credit Card") && fullBody.includes("debited")) {
-          let amtM = fullBody.match(/Rs\.\s*([\d,]+\.\d{2})/i);
-          let merM = fullBody.match(/towards\s+(.*?)\s+on/i); // Improved capture
-          let datM = fullBody.match(/on\s+(\d{1,2}\s+[A-Za-z]+\s*,\s*\d{4})/i);
-          
-          amount = amtM ? amtM[1] : "0.00";
-          merchant = merM ? merM[1].trim() : "HDFC Debit";
-          txnDate = datM ? datM[1] : "";
-          paymentMode = "Credit Card";
-          sourceBank = "HDFC Bank";
-          parsedSuccessfully = true;
-      }
-      else if (fullBody.includes("Dividend") || lowerSub.includes("dividend")) {
-      // 1. Extract Amount: Matches "Rs. 4" or "₹4"
-      let amtM = fullBody.match(/(?:Rs\.|₹)\s*([\d,]+\.?\d*)/i);
-      amount = amtM ? amtM[1] : "0.00";
-      
-      // 2. Extract Merchant: Looks for text appearing BEFORE the word "dividend"
-      // This assumes the format is "[Stock Name] dividend..."
-      let merM = fullBody.match(/(.*?)(?:dividend)/i);
-      merchant = merM ? merM[1].trim() : "Stock Dividend";
-      
-      // 3. Clean up the Merchant: If the extracted name is too long, truncate it
-      if (merchant.length > 30) {
-          // Often the name is at the end of the previous sentence
-          let words = merchant.split(' ');
-          merchant = words.slice(-2).join(' '); // Take only the last 2 words (e.g., "TATA STEEL")
-      }
-      
-      txnDate = Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), "yyyy-MM-dd");
-      paymentMode = "Bank Credit";
-      columnType = "Income";
-      sourceBank = "Investment Account";
-      parsedSuccessfully = true;
     }
-    else if (fullBody.includes("PRAN") || fullBody.includes("NPS")) {
-      // Extract Amount
-      let amtM = fullBody.match(/Rs\.\s*([\d,]+\.\d{2})/i);
-      amount = amtM ? amtM[1] : "0.00";
-      
-      // Merchant is NPS
-      merchant = "NPS Contribution";
-      
-      // Extract Date (Look for DD/MM/YYYY or similar)
-      let datM = fullBody.match(/(\d{2}\/\d{2}\/\d{4})/);
-      txnDate = datM ? datM[1] : Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), "yyyy-MM-dd");
-      
-      paymentMode = "Auto-Debit";
-      columnType = "Expense"; // It's an expense/investment outflow
-      sourceBank = "NPS";
-      parsedSuccessfully = true;
-    }
-
-  // Fallback Engine
-if (!parsedSuccessfully) {
-  merchant = extractMerchant(fullBody, msg.getSubject());
-  let details = extractBankDetails(fullBody);
-  let amtM = fullBody.match(/(?:Rs\.|INR|₹)\s*([\d,]+\.\d{2})/i) || fullBody.match(/(?:Rs\.|INR|₹)\s*([\d,]+)/i) || msg.getSubject().match(/(?:₹|Rs\.|INR)\s*([\d,]+)/i);
-  if (amtM) amount = amtM[1];
-  
-  let dateM = fullBody.match(/on\s+\*?(\d{1,2}\s+[A-Za-z]{3},\s*\d{4})/i) || fullBody.match(/on\s+(\d{2}-\d{2}-\d{2,4})/);
-  if (dateM) txnDate = dateM[1];
-  
-  let isCreditCard = lowerBody.includes("credit card") || lowerSub.includes("credit card");
-  
-  if (lowerBody.includes("credited") || lowerBody.includes("received")) {
-    columnType = "Income"; 
-    paymentMode = "Inward Transfer";
-  } else if (lowerBody.includes("debited") || lowerBody.includes("spent") || lowerSub.includes("payment")) {
-    columnType = "Expense"; 
-    paymentMode = isCreditCard ? "Credit Card" : (lowerBody.includes("vpa") ? "UPI" : "Bank Account");
   }
-
-  let merM = fullBody.match(/towards\s+([^on\.]+)\s+on/i) || fullBody.match(/from\s+([^on\.]+)\s+via/i) || fullBody.match(/Info:\s*([^\s]+)/i);
-  if (merM) { 
-    merchant = cleanText(merM[1]); // Ensure you use the cleanText helper
-    if (merchant.length > 50) merchant = merchant.substring(0, 47) + "..."; 
-  }
-
-  // 1. Identify the base bank name
-  let bankNameMatch = fullBody.match(/([A-Za-z0-9]+)\s+Bank/i);
-  let baseBankName = bankNameMatch ? bankNameMatch[1] + " Bank" : (lowerBody.includes("sbi") ? "SBI" : "General Bank");
-
-  // 2. Identify the identifier (Account/Card digits)
-  let extractedDigits = fullBody.match(/(?:account|a\/c|card|ending)\s*\*?\s*(?:ending)?\s*\*?\s*([X\d]{3,5})/i);
-  let identifier = details || (extractedDigits ? extractedDigits[1] : "");
-
-  // 3. Construct the sourceBank string
-  if (identifier) {
-    let typeLabel = isCreditCard ? "Card " : "a/c ";
-    sourceBank = baseBankName + " (" + typeLabel + identifier + ")";
-  } else {
-    sourceBank = baseBankName;
-  }
+  sortExpensesByDate();
+  const msgText = "Done! Fetched " + rowsAddedCount + " records.";
+  ui ? ui.alert(msgText) : console.log(msgText);
 }
 
-      // --- UPDATED SAFETY LOGGING ZONE ---
-    // --- UPDATED LOGGING ZONE ---
-    if (amount !== "0.00") {
-      amount = amount.replace(/,/g, '');
-      
-      // Clean the merchant name immediately
-      merchant = cleanText(merchant); 
-
-      // 1. Determine the source date
-      let dateObj = txnDate ? parseMyDate(txnDate) : msg.getDate();
-      if (isNaN(dateObj.getTime())) dateObj = msg.getDate();
-      let emailDateStr = Utilities.formatDate(dateObj, Session.getScriptTimeZone(), "yyyy-MM-dd");
-      
-      let category = autoCategorize(merchant, msg.getSubject(), columnType);
-      if (category === "IGNORE") {
-        continue; // Skip this row entirely
-      }
-      
-      // Generate a much cleaner log snippet
-      let cleanLogText = fullBody.replace(/https?:\/\/[^\s]+/g, '') // Remove URLs
-                                .replace(/[*]/g, '')              // Remove asterisks
-                                .replace(/\s+/g, ' ')             // Normalize spaces
-                                .trim();
-      let textToLog = cleanLogText.substring(0, 150);
-      
-      // --- CENTRALIZED SOURCE BANK LOGIC ---
-      // If it's still "Unknown Bank", determine it based on the full body text
-      if (sourceBank === "Unknown Bank" || sourceBank === "Unknown") {
-        let bankBase = "General Bank";
-        if (lowerBody.includes("hdfc")) bankBase = "HDFC Bank";
-        else if (lowerBody.includes("icici")) bankBase = "ICICI Bank";
-        else if (lowerBody.includes("kotak")) bankBase = "Kotak Bank";
-        else if (lowerBody.includes("sbi")) bankBase = "SBI";
-        else if (lowerBody.includes("axis")) bankBase = "Axis Bank";
-
-        let details = extractBankDetails(fullBody);
-        if (details) {
-          let typeLabel = (lowerBody.includes("credit card") || lowerSub.includes("credit card")) ? "Card " : "a/c ";
-          sourceBank = bankBase + " (" + typeLabel + details + ")";
-        } else {
-          sourceBank = bankBase;
-        }
-      }
-
-      // --- END OF CENTRALIZED LOGIC ---
-      sheet.appendRow([emailDateStr, amount, merchant, paymentMode, category, columnType, sourceBank, textToLog]);
-      rowsAddedCount++;
-    }
-    }
-  }
-
-  sortExpensesByDate();
+function parseEmailMessage(msg) {
+  let fullBody = (msg.getBody() || "").replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  let lowerBody = fullBody.toLowerCase();
+  let lowerSub = (msg.getSubject() || "").toLowerCase();
   
-  const msg = "Done! Fetched " + rowsAddedCount + " records.";
-  if (ui) {
-    ui.alert(msg);
-  } else {
-    console.log(msg); // This will show up in your Apps Script execution log
+  // Initialize result object
+  let result = { 
+    amount: "0.00", 
+    merchant: "Unknown", 
+    txnDate: "", 
+    paymentMode: "Bank Account", 
+    columnType: "Expense", 
+    sourceBank: "Unknown Bank" 
+  };
+
+  let parsedSuccessfully = false;
+
+  // --- TEMPLATES ---
+  if (fullBody.includes("towards VPA")) {
+    let amtM = fullBody.match(/Rs\.\s*([\d,]+\.\d{2})/i);
+    let datM = fullBody.match(/on\s+(\d{2}-\d{2}-\d{2,4})/);
+    let bracketM = fullBody.match(/towards VPA\s+[^\s]+\s+\((.*?)\)/i);
+    let rawVpaM = fullBody.match(/towards VPA\s+([^\s]+)/i);
+    result.amount = amtM ? amtM[1] : "0.00";
+    result.merchant = bracketM ? bracketM[1].trim() : (rawVpaM ? rawVpaM[1].trim() : "UPI Payment");
+    result.txnDate = datM ? datM[1] : "";
+    result.paymentMode = "UPI";
+    parsedSuccessfully = true;
   }
+  else if (fullBody.includes("ICICI Bank Account") && fullBody.includes("credited")) {
+    let amtM = fullBody.match(/credited with INR\s*([\d,]+)/i);
+    let datM = fullBody.match(/on\s+(\d{2}-[A-Za-z]{3}-\d{2,4})/i);
+    result.amount = amtM ? amtM[1] : "0.00";
+    result.txnDate = datM ? datM[1] : "";
+    result.merchant = "ICICI Interest Payment";
+    result.paymentMode = "Bank Credit";
+    result.columnType = "Income";
+    parsedSuccessfully = true;
+  }
+  else if (fullBody.includes("successfully debited") && fullBody.includes("towards")) {
+    let amtM = fullBody.match(/Rs\.\s*([\d,]+)/i);
+    let merM = fullBody.match(/towards\s+(.*?)\./i);
+    let datM = fullBody.match(/on\s+(\d{4}\/\d{2}\/\d{2})/);
+    result.amount = amtM ? amtM[1] : "0.00";
+    result.merchant = merM ? merM[1].replace(/[*]/g, '').trim() : "Kotak Debit";
+    result.txnDate = datM ? datM[1] : "";
+    result.paymentMode = "Bank Account";
+    parsedSuccessfully = true;
+  }
+  else if (fullBody.includes("credited to your Kotak Bank")) {
+    let amtM = fullBody.match(/Rs\.\s*([\d,]+)/i);
+    let datM = fullBody.match(/on\s+(\d{2}-[A-Za-z]{3}-\d{2,4})/i);
+    let merM = fullBody.match(/transaction from\s+(.*?)\./i);
+    result.amount = amtM ? amtM[1] : "0.00";
+    result.merchant = merM ? merM[1].trim() : "NEFT Credit";
+    result.txnDate = datM ? datM[1] : "";
+    result.paymentMode = "NEFT Inward";
+    result.columnType = "Income";
+    parsedSuccessfully = true;
+  }
+  else if (fullBody.includes("State Bank of India") && fullBody.includes("Amount:")) {
+    let amtM = fullBody.match(/Amount:\s*INR\s*([\d,]+\.\d{2})/i);
+    let datM = fullBody.match(/Date:\s*([\d\/]+)/i);
+    let merM = fullBody.match(/Sent by:\s*(.*?)\s*Sender/i);
+    result.amount = amtM ? amtM[1] : "0.00";
+    result.merchant = merM ? merM[1].trim() : "SBI Credit";
+    result.txnDate = datM ? datM[1] : "";
+    result.paymentMode = "NEFT Inward";
+    result.columnType = "Income";
+    parsedSuccessfully = true;
+  }
+  else if (lowerSub.includes("sip auto payment") || lowerSub.includes("buy order placed")) {
+    let amtM = msg.getSubject().match(/(?:₹|Rs\.)\s*([\d,]+\.\d{2}|[\d,]+)/i) || fullBody.match(/(?:₹|Rs\.)\s*([\d,]+\.\d{2}|[\d,]+)/i);
+    let merM = fullBody.match(/in\s+(.*?)\s+has been/i) || fullBody.match(/order of.*?\s+in\s+(.*?)\s+has/i);
+    result.amount = amtM ? amtM[1] : "0.00";
+    result.merchant = merM ? merM[1].trim() : "Mutual Fund SIP";
+    result.paymentMode = "Auto-Debit";
+    parsedSuccessfully = true;
+  }
+  else if (lowerBody.includes("smartpay")) {
+    let amtM = fullBody.match(/Rs\.\s*([\d,]+\.\d{2})/i);
+    let merM = fullBody.match(/Biller Name:\s*(.*?)(?:Unique|$)/i);
+    result.amount = amtM ? amtM[1] : "0.00";
+    result.merchant = merM ? merM[1].trim() : "SmartPay Bill";
+    result.paymentMode = "SmartPay";
+    result.sourceBank = "SmartPay";
+    parsedSuccessfully = true;
+  }
+  else if (fullBody.includes("HDFC Bank Credit Card") && fullBody.includes("debited")) {
+    let amtM = fullBody.match(/Rs\.\s*([\d,]+\.\d{2})/i);
+    let merM = fullBody.match(/towards\s+(.*?)\s+on/i);
+    let datM = fullBody.match(/on\s+(\d{1,2}\s+[A-Za-z]+\s*,\s*\d{4})/i);
+    result.amount = amtM ? amtM[1] : "0.00";
+    result.merchant = merM ? merM[1].trim() : "HDFC Debit";
+    result.txnDate = datM ? datM[1] : "";
+    result.paymentMode = "Credit Card";
+    parsedSuccessfully = true;
+  }
+  else if (fullBody.includes("Dividend") || lowerSub.includes("dividend")) {
+    let amtM = fullBody.match(/(?:Rs\.|₹)\s*([\d,]+\.?\d*)/i);
+    result.amount = amtM ? amtM[1] : "0.00";
+    let merM = fullBody.match(/(.*?)(?:dividend)/i);
+    result.merchant = merM ? merM[1].trim() : "Stock Dividend";
+    result.paymentMode = "Bank Credit";
+    result.columnType = "Income";
+    result.sourceBank = "Investment Account";
+    parsedSuccessfully = true;
+  }
+  else if (fullBody.includes("PRAN") || fullBody.includes("NPS")) {
+    let amtM = fullBody.match(/Rs\.\s*([\d,]+\.\d{2})/i);
+    result.amount = amtM ? amtM[1] : "0.00";
+    result.merchant = "NPS Contribution";
+    result.txnDate = fullBody.match(/(\d{2}\/\d{2}\/\d{4})/)?.[1] || "";
+    result.paymentMode = "Auto-Debit";
+    result.columnType = "Expense";
+    result.sourceBank = "NPS";
+    parsedSuccessfully = true;
+  }
+
+  // Fallback Engine
+  if (!parsedSuccessfully) {
+    result.merchant = extractMerchant(fullBody, msg.getSubject());
+    let amtM = fullBody.match(/(?:Rs\.|INR|₹)\s*([\d,]+\.\d{2})/i) || fullBody.match(/(?:Rs\.|INR|₹)\s*([\d,]+)/i) || msg.getSubject().match(/(?:₹|Rs\.|INR)\s*([\d,]+)/i);
+    if (amtM) result.amount = amtM[1];
+    
+    let dateM = fullBody.match(/on\s+\*?(\d{1,2}\s+[A-Za-z]{3},\s*\d{4})/i) || fullBody.match(/on\s+(\d{2}-\d{2}-\d{2,4})/);
+    if (dateM) result.txnDate = dateM[1];
+    
+    if (lowerBody.includes("credited") || lowerBody.includes("received")) {
+      result.columnType = "Income"; 
+      result.paymentMode = "Inward Transfer";
+    } else if (lowerBody.includes("debited") || lowerBody.includes("spent") || lowerSub.includes("payment")) {
+      result.columnType = "Expense"; 
+      result.paymentMode = (lowerBody.includes("credit card") || lowerSub.includes("credit card")) ? "Credit Card" : (lowerBody.includes("vpa") ? "UPI" : "Bank Account");
+    }
+  }
+
+  return result;
+}
+
+function processAndLogExpense(sheet, msg, data) {
+  let { amount, merchant, txnDate, paymentMode, columnType, sourceBank } = data;
+  let fullBody = (msg.getBody() || "").replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  let lowerBody = fullBody.toLowerCase();
+  
+  // 1. Centralized Bank Logic
+  if (["Unknown Bank", "Unknown", "General Bank"].includes(sourceBank)) {
+    if (lowerBody.includes("amazon pay")) sourceBank = "Amazon Pay eGift Card";
+    else if (lowerBody.includes("hdfc")) sourceBank = "HDFC Bank";
+    else if (lowerBody.includes("icici")) sourceBank = "ICICI Bank";
+    else if (lowerBody.includes("kotak")) sourceBank = "Kotak Bank";
+    else if (lowerBody.includes("sbi")) sourceBank = "SBI Bank";
+    else if (lowerBody.includes("axis")) sourceBank = "Axis Bank";
+    else sourceBank = "General Bank";
+
+    let details = extractBankDetails(fullBody);
+    if (details && !sourceBank.includes("Amazon Pay")) {
+      let typeLabel = (lowerBody.includes("credit card")) ? "Card " : "a/c ";
+      sourceBank += " (" + typeLabel + details + ")";
+    }
+  }
+
+  // 2. Formatting Date
+  let dateObj = txnDate ? parseMyDate(txnDate) : msg.getDate();
+  dateObj.setHours(0, 0, 0, 0);
+
+  // 3. Categorization
+  let category = autoCategorize(merchant, msg.getSubject(), columnType, sourceBank);
+  if (category === "IGNORE") return false;
+
+  // 4. Traceable Logging
+  let combinedLog = msg.getSubject() + " | " + getReadableText(fullBody).substring(0, 100);
+  
+  // 5. Append
+  sheet.appendRow([dateObj, amount.replace(/,/g, ''), cleanText(merchant), paymentMode, category, columnType, sourceBank, combinedLog]);
+  return true;
 }
 
 function extractMerchant(body, subject) {
@@ -415,6 +322,16 @@ function parseMyDate(dateStr) {
   }
   
   return new Date(year, month, day);
+}
+
+function getReadableText(text) {
+  return text
+    .replace(/<[^>]*>/g, ' ')           // Remove any leftover HTML tags
+    .replace(/&nbsp;/g, ' ')            // Remove HTML space entities
+    .replace(/&amp;/g, '&')             // Fix ampersands
+    .replace(/\s+/g, ' ')               // Collapse multiple spaces into one
+    .replace(/\s*\.\s*/g, '. ')         // Ensure proper spacing after dots
+    .trim();                            // Trim start/end whitespace
 }
 
 function standardizeDate(dateStr) {
@@ -542,22 +459,41 @@ function sortExpensesByDate() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Expenses");
   
-  // Get data range excluding the header row
   const lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return; // Nothing to sort
-  
-  // Define range (starting from row 2, column 1, down to last row)
+  if (lastRow <= 1) return; 
+
+  // Force the date column to be strictly YYYY-MM-DD
+  const dateRange = sheet.getRange(2, 1, lastRow - 1, 1);
+  dateRange.setNumberFormat("yyyy-mm-dd"); 
+
+  // Sort the data
   const range = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn());
-  
-  // Sort by Column 1 (Date) in Ascending order (oldest at top, newest at bottom)
   range.sort({column: 1, ascending: true});
 }
 
 // 3. CATEGORIZATION ENGINE
-function autoCategorize(merchant, subject, columnType) {
-  let m = merchant.toLowerCase();
-  let s = subject.toLowerCase();
+function autoCategorize(merchant, subject, columnType, sourceBank) {
+  const mappings = getMappings(); 
+  const m = merchant.toLowerCase();
+  const bank = (sourceBank || "").toLowerCase();
 
+  // TIER 1: Check Mappings Sheet (Highest Priority - keeps your manual overrides)
+  for (let key in mappings) {
+    if (m.includes(key.toLowerCase())) return mappings[key];
+  }
+
+  // TIER 2: Bank Account-Based Defaults (The new logic)
+  if (bank.includes("8910")) return "Misc";0
+  
+  if (bank.includes("3141")) return "Groceries"; // Defaulting to Groceries for now
+  
+  if (bank.includes("xx2722")) return "Shopping"; // Defaulting to Shopping for now
+  
+  if (bank.includes("xx094")) return "Food"; // Defaulting to Food for now
+  
+  if (bank.includes("xx540")) return "Travel";
+
+  let s = subject.toLowerCase();
 
   // 1. HIGH PRIORITY OVERRIDES (Check these before anything else)
   if (m.includes("nps") || m.includes("pran")) return "Investment";
@@ -616,10 +552,13 @@ function autoCategorize(merchant, subject, columnType) {
     return "Shopping";
   }
 
-  // 1. FILTER OUT NOISE (Add this at the top)
+  // 1. FILTER OUT NOISE
   if (s.includes("no-reply") || s.includes("add to contact") || s.includes("marketing") || s.includes("failed") 
       || s.includes("sorry") || s.includes("upcoming sip") || s.includes("surprise") || s.includes("wallet points") 
-      || s.includes("cashback")) {
+      || s.includes("cashback")
+      || s.includes("reminder") 
+      || s.includes("due tomorrow") 
+      || s.includes("bill payment is due")) { // Added specific rules for reminders
     return "IGNORE";
   }
 
@@ -630,10 +569,74 @@ function autoCategorize(merchant, subject, columnType) {
   return "Misc";
 }
 
+function getMappings() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Mappings");
+  if (!sheet) return {}; // Return empty object if sheet doesn't exist
+  
+  const data = sheet.getDataRange().getValues();
+  let mappings = {};
+  
+  // Start from 1 to skip header row
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0]) { // Column A: Merchant
+      mappings[data[i][0].toString().toLowerCase()] = data[i][1]; // Column B: Category
+    }
+  }
+  return mappings;
+}
+
+function syncMapping() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const expSheet = ss.getSheetByName("Expenses");
+  const mapSheet = ss.getSheetByName("Mappings");
+  
+  if (!mapSheet || !expSheet) {
+    SpreadsheetApp.getUi().alert("Error: 'Expenses' or 'Mappings' sheet not found.");
+    return;
+  }
+  
+  // 1. Get all data from Expenses
+  const expData = expSheet.getDataRange().getValues();
+  let uniqueMappings = {};
+  
+  // 2. Loop through all rows (skipping header)
+  // Assuming Col C is Merchant (index 2) and Col E is Category (index 4)
+  for (let i = 1; i < expData.length; i++) {
+    let merchant = expData[i][2];
+    let category = expData[i][4];
+    
+    // Only map if merchant and category exist and aren't 'Misc'
+    // This ensures only "trained" data is added
+    if (merchant && category && category.toString().toLowerCase() !== "misc") {
+      uniqueMappings[merchant.toString().toLowerCase()] = category;
+    }
+  }
+  
+  // 3. Clear existing Mappings (keeping only the header)
+  // We clear from row 2 downwards
+  mapSheet.getRange(2, 1, Math.max(mapSheet.getLastRow() - 1, 1), 2).clearContent();
+  
+  // 4. Convert object to array for writing back to sheet
+  let output = [];
+  for (let merchant in uniqueMappings) {
+    output.push([merchant, uniqueMappings[merchant]]);
+  }
+  
+  // 5. Write to Mappings sheet
+  if (output.length > 0) {
+    mapSheet.getRange(2, 1, output.length, 2).setValues(output);
+    SpreadsheetApp.getUi().alert("Success! " + output.length + " unique mappings synced.");
+  } else {
+    SpreadsheetApp.getUi().alert("No valid mappings found to sync.");
+  }
+}
+
 // 4. MENU
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('📊 Expense Tracker')
     .addItem('1. Fetch New Emails', 'fetchAllEmailsRaw')
     .addItem('2. Clean Duplicate Rows', 'clearSheetDuplicates')
+    .addItem('3. Sync Mappings', 'syncMapping')
     .addToUi();
 }
