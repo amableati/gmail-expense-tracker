@@ -60,7 +60,7 @@ function fetchAllEmailsRaw() {
   let tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
   const endDateStr = Utilities.formatDate(tomorrow, Session.getScriptTimeZone(), "yyyy/MM/dd");
   
-  const gmailSearchQuery = `("debited" OR "credited" OR "Transaction alert" OR "SIP Auto Payment" OR "Buy order placed" OR "SmartPay" OR "Amazon Pay") -("reminder" OR "due") after:${startDateStr.replace(/\//g, '-')} before:${endDateStr.replace(/\//g, '-')}`;
+  const gmailSearchQuery = `("debited" OR "credited" OR "Transaction alert" OR "SIP Auto Payment" OR "Buy order placed" OR "SmartPay" OR "Amazon Pay" OR "ATM withdrawal") -("reminder" OR "due") after:${startDateStr.replace(/\//g, '-')} before:${endDateStr.replace(/\//g, '-')}`;
   const threads = GmailApp.search(gmailSearchQuery, 0, 500); 
 
   if (threads.length === 0) { ui && ui.alert("No new transactions found."); return; }
@@ -98,7 +98,39 @@ function parseEmailMessage(msg) {
   let parsedSuccessfully = false;
 
   // --- TEMPLATES ---
-  if (fullBody.includes("towards VPA")) {
+// HDFC Debit Card - ATM Withdrawal
+if (lowerBody.includes("atm withdrawal")) {
+  let amtM = fullBody.match(
+    /ATM\s+withdrawal\s+for\s+Rs\.?\s*([\d,]+(?:\.\d{1,2})?)/i
+  );
+
+  let merM = fullBody.match(
+    /\bin\s+(.+?)\s+at\s+(.+?)\s+on\s+/i
+  );
+
+  let datM = fullBody.match(
+    /\bon\s+(\d{2}-\d{2}-\d{4})\s+(\d{2}:\d{2}:\d{2})/i
+  );
+
+  result.amount = amtM ? amtM[1] : "0.00";
+
+  if (merM) {
+    result.merchant = merM[2].trim();
+  } else {
+    result.merchant = "ATM Withdrawal";
+  }
+
+  result.txnDate = datM
+    ? datM[1] + " " + datM[2]
+    : "";
+
+  result.paymentMode = "ATM";
+  result.columnType = "Expense";
+  result.sourceBank = "HDFC Bank";
+
+  parsedSuccessfully = true;
+}
+else if (fullBody.includes("towards VPA")) {
     let amtM = fullBody.match(/Rs\.\s*([\d,]+\.\d{2})/i);
     let datM = fullBody.match(/on\s+(\d{2}-\d{2}-\d{2,4})/);
     let bracketM = fullBody.match(/towards VPA\s+[^\s]+\s+\((.*?)\)/i);
@@ -164,8 +196,8 @@ function parseEmailMessage(msg) {
     let merM = fullBody.match(/Biller Name:\s*(.*?)(?:Unique|$)/i);
     result.amount = amtM ? amtM[1] : "0.00";
     result.merchant = merM ? merM[1].trim() : "SmartPay Bill";
-    result.paymentMode = "SmartPay";
-    result.sourceBank = "SmartPay";
+    result.paymentMode = "Credit Card";
+    result.sourceBank = "HDFC Bank (Card 8554)";
     parsedSuccessfully = true;
   }
   else if (fullBody.includes("HDFC Bank Credit Card") && fullBody.includes("debited")) {
@@ -244,7 +276,19 @@ function processAndLogExpense(sheet, msg, data) {
 
   // 2. Formatting Date
   let dateObj = txnDate ? parseMyDate(txnDate) : msg.getDate();
-  dateObj.setHours(0, 0, 0, 0);
+
+  if (txnDate) {
+    const messageDate = msg.getDate();
+
+    // parseMyDate() currently returns only the date at 00:00:00.
+    // Use the Gmail message time as the time component.
+    dateObj.setHours(
+      messageDate.getHours(),
+      messageDate.getMinutes(),
+      messageDate.getSeconds(),
+      0
+    );
+  }
 
   // 3. Categorization
   let category = autoCategorize(merchant, msg.getSubject(), columnType, sourceBank);
@@ -287,40 +331,65 @@ function extractMerchant(body, subject) {
 
 function parseMyDate(dateStr) {
   if (!dateStr) return new Date();
-  
-  // Clean: Replace separators with spaces, remove commas, normalize whitespace
-  let cleanStr = dateStr.replace(/[\/\-\.\,]/g, ' ').replace(/\s+/g, ' ').trim();
+
+  dateStr = dateStr.trim();
+
+  // DD-MM-YYYY HH:mm:ss
+  let dateTimeMatch = dateStr.match(
+    /^(\d{2})-(\d{2})-(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/
+  );
+
+  if (dateTimeMatch) {
+    return new Date(
+      Number(dateTimeMatch[3]),
+      Number(dateTimeMatch[2]) - 1,
+      Number(dateTimeMatch[1]),
+      Number(dateTimeMatch[4]),
+      Number(dateTimeMatch[5]),
+      Number(dateTimeMatch[6])
+    );
+  }
+
+  // Existing date-only logic
+  let cleanStr = dateStr
+    .replace(/[\/\-\.\,]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
   let parts = cleanStr.split(' ');
-  
+
   let day, month, year;
 
-  // Logic: Detect if Year is in the first position (e.g., 2026 06 15) or third (e.g., 15 06 2026)
   let firstPart = parseInt(parts[0]);
   let lastPart = parseInt(parts[parts.length - 1]);
 
   if (firstPart > 2000) {
-    // Format: YYYY MM DD
+    // YYYY MM DD
     year = firstPart;
     month = parseInt(parts[1]) - 1;
     day = parseInt(parts[2]);
   } else {
-    // Format: DD MM YYYY (or DD Month YYYY)
+    // DD MM YYYY / DD Month YYYY
     day = firstPart;
     month = parts[1];
     year = lastPart;
-    
-    // Ensure 2-digit years are treated as 2000s
+
     if (year < 100) year += 2000;
-    
-    // Handle Month names
+
     if (isNaN(month)) {
-      const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-      month = months.indexOf(month.toLowerCase().substring(0, 3));
+      const months = [
+        "jan", "feb", "mar", "apr", "may", "jun",
+        "jul", "aug", "sep", "oct", "nov", "dec"
+      ];
+
+      month = months.indexOf(
+        month.toLowerCase().substring(0, 3)
+      );
     } else {
       month = parseInt(month) - 1;
     }
   }
-  
+
   return new Date(year, month, day);
 }
 
@@ -366,13 +435,26 @@ function clearSheetDuplicates() {
   // First Pass: Scan all rows to handle Merges and Deletions
   for (let r = 1; r < data.length; r++) {
     let rowDate = data[r][0];
-    let formattedDate = rowDate instanceof Date ? Utilities.formatDate(rowDate, Session.getScriptTimeZone(), "yyyy-MM-dd") : rowDate.toString().trim();
-    let rowAmount = Number(data[r][1]).toFixed(2);
-    
-    let currentMerchant = data[r][2].toString().trim();
-    let currentCategory = data[r][4].toString().trim();
 
-    let coreKey = formattedDate + "_" + rowAmount;
+  let formattedDate;
+
+  if (rowDate instanceof Date && !isNaN(rowDate.getTime())) {
+    formattedDate = Utilities.formatDate(
+      rowDate,
+      Session.getScriptTimeZone(),
+      "yyyy-MM-dd HH:mm:ss"
+    );
+  } else {
+    formattedDate = rowDate.toString().trim();
+  }
+
+  let rowAmount = Number(data[r][1]).toFixed(2);
+
+  let currentMerchant = data[r][2].toString().trim();
+  let currentCategory = data[r][4].toString().trim();
+
+  // Duplicate key = Date + Time + Amount
+  let coreKey = formattedDate + "_" + rowAmount;
 
     if (trackedKeys[coreKey] !== undefined) {
       let baselineRowIndex = trackedKeys[coreKey];
@@ -464,7 +546,7 @@ function sortExpensesByDate() {
 
   // Force the date column to be strictly YYYY-MM-DD
   const dateRange = sheet.getRange(2, 1, lastRow - 1, 1);
-  dateRange.setNumberFormat("yyyy-mm-dd"); 
+  dateRange.setNumberFormat("yyyy-mm-dd HH:mm:ss");
 
   // Sort the data
   const range = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn());
